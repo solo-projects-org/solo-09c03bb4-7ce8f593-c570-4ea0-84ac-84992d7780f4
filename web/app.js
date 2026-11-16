@@ -44,6 +44,7 @@ async function refresh() {
   renderEvents(s);
   renderDecodes(s);
   renderHistory(s);
+  renderDelivery(s);
 }
 
 function renderStates(s) {
@@ -252,6 +253,106 @@ $("btn-sim").onclick = async () => {
     $("sim-msg").textContent = "故障注入失败：" + e.message;
     $("sim-msg").className = "msg-err";
   }
+};
+
+// ---------------- 分批交付 ----------------
+function renderDelivery(s) {
+  const d = s.delivery;
+  if (!d) return;
+  const p = d.progress;
+  $("delivery-progress").innerHTML =
+    `<div>仓内事件总数：<b>${p.total_events}</b> · 已确认交付：<b>${p.confirmed_events}</b>
+       · 已领取（含未确认）：<b>${p.delivered_claimed_events}</b>
+       · 下一条未确认序号：<b>${p.next_unconfirmed_seq}</b> · 每批上限：${p.batch_size}</div>
+     <div style="margin-top:6px">当前未确认批次：${
+       p.open_batch
+         ? `<span class="badge pending">批次 #${p.open_batch.batch_no}（序号 ${p.open_batch.first_event_seq}–${p.open_batch.last_event_seq}，${p.open_batch.event_count} 条）</span>`
+         : '<span class="hint">无（可领取新批次）</span>'}</div>`;
+
+  const tb = document.querySelector("#delivery-batches-table tbody");
+  tb.innerHTML = d.batches.map((b) => `<tr>
+      <td>#${b.batch_no}</td>
+      <td>${badge(b.status)}</td>
+      <td>${b.first_event_seq} – ${b.last_event_seq}</td>
+      <td>${b.event_count}</td>
+      <td>${esc(b.created_at)}</td>
+      <td>${esc(b.confirmed_at || "")}</td>
+      <td><a href="/api/delivery/batches/${b.batch_no}/download?download=1" target="_blank">下载 JSON</a></td>
+    </tr>`).join("") || `<tr><td colspan="7" class="hint">尚无交付批次</td></tr>`;
+
+  renderOpenBatch(p.open_batch);
+}
+
+async function renderOpenBatch(meta) {
+  const box = $("delivery-open");
+  if (!meta) {
+    box.innerHTML = "<div class='hint'>当前没有未确认批次。</div>";
+    return;
+  }
+  try {
+    const r = await api(`/api/delivery/batches/${meta.batch_no}`);
+    const rows = r.batch.events.map((e) => `<tr>
+        <td>${e.seq}</td>
+        <td>${esc(e.event_id)}</td>
+        <td>v${e.writer_version}<div class="pill">${esc(e.writer_fp.slice(0, 8))}</div></td>
+        <td><div class="hint">原 Avro 字节（Base64）</div><pre>${esc(e.avro_bytes_b64)}</pre></td>
+        <td><pre>${esc(pretty(e.schema))}</pre></td>
+      </tr>`).join("");
+    box.innerHTML =
+      `<div class="meta">批次 #${r.batch.batch_no} · 序号 ${r.batch.first_event_seq}–${r.batch.last_event_seq}
+         · ${r.batch.event_count} 条 · 领取于 ${esc(r.batch.created_at)}</div>
+       <table><thead><tr><th>入仓序号</th><th>事件号</th><th>写入版本</th><th>原 Avro 字节</th><th>对应 schema</th></tr></thead>
+       <tbody>${rows}</tbody></table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="msg-err">批次内容加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+$("btn-delivery-claim").onclick = async () => {
+  try {
+    const r = await api("/api/delivery/claim", { method: "POST" });
+    if (r.empty) {
+      showMsg("delivery-msg", "没有新事件可领取（返回空，未创建批次）。", true);
+    } else {
+      const b = r.batch;
+      showMsg("delivery-msg",
+        (r.created ? "已冻结新批次" : "该批次未确认，重复领取返回同一批次") +
+        `：#${b.batch_no}，序号 ${b.first_event_seq}–${b.last_event_seq}，${b.event_count} 条（字节不变）。`,
+        true);
+    }
+  } catch (e) {
+    showMsg("delivery-msg", "领取失败：" + e.message, false);
+  }
+  await refresh();
+};
+
+$("btn-delivery-download").onclick = async () => {
+  const st = (await api("/api/status")).delivery.progress;
+  if (!st.open_batch) {
+    return showMsg("delivery-msg", "当前没有未确认批次，请先领取。", false);
+  }
+  window.open(`/api/delivery/batches/${st.open_batch.batch_no}/download?download=1`,
+              "_blank");
+};
+
+$("btn-delivery-confirm").onclick = async () => {
+  try {
+    const st = (await api("/api/status")).delivery.progress;
+    if (!st.open_batch) {
+      return showMsg("delivery-msg", "当前没有未确认批次。", false);
+    }
+    const r = await api("/api/delivery/confirm", {
+      method: "POST", body: { batch_no: st.open_batch.batch_no },
+    });
+    showMsg("delivery-msg",
+      r.idempotent
+        ? `批次 #${r.batch.batch_no} 此前已确认（幂等，进度不变）。`
+        : `批次 #${r.batch.batch_no} 已确认，进度推进至第 ${r.progress.confirmed_events} 条。`,
+      true);
+  } catch (e) {
+    showMsg("delivery-msg", "确认被拒绝：" + e.message, false);
+  }
+  await refresh();
 };
 
 // ---------------- 初始化：填入示例 schema ----------------

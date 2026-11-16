@@ -76,6 +76,27 @@ reader 'string' cannot resolve writer 'int' (no numeric/type promotion path)
 事件入仓只读取**已确认的生效写入指针**，pending 期间不阻塞，兼容事件持续入仓；
 每条事件留存其写入时的 schema 指纹与版本，读取切换守卫会回溯全部历史事件。
 
+## 分批交付（数仓值班员 → 分析组）
+
+值班员把留存事件**分批、可确认、可断线续传**地交付给分析组，交付状态全部
+落 webapp 的 SQLite，重启后从未确认批次继续。
+
+- **领取 `POST /api/delivery/claim`**：每批最多 20 条，按入仓顺序（事件表
+  `rowid` 即持久入仓序号）原子冻结为一个批次。已有未确认批次时重复领取（或
+  重启后领取）返回**同一批次**：批次号、事件范围、原始 Avro 字节完全不变；
+  无新事件时返回空且不建批次。
+- **下载 `GET /api/delivery/batches/{n}/download`**：返回领取时冻结的 JSON
+  快照（不从活表重算），逐条含事件号、原 Avro 字节（Base64）、写入版本与
+  对应的写入 schema；加 `?download=1` 以附件方式下载。
+- **确认 `POST /api/delivery/confirm`**：只有确认当前未确认批次才推进进度；
+  确认旧批次时若已有更新的未确认批次会被 409 拒绝，**重复确认旧批次不能越过
+  下一批**；对已是最新的已确认批次重复确认幂等成功。
+- **交错语义**：已领取批次存自有快照，领取后新入仓事件与写入格式切换都不改
+  变它，新事件只进后续批次；领取 / 确认各在一个 `BEGIN IMMEDIATE` 事务内完成，
+  失败整体回滚，不留半批、不跳过未确认事件。
+- 进度可通过 `GET /api/delivery/progress` 或 `/api/status` 的 `delivery` 块查看，
+  网页第 ⑦ 区提供领取 / 下载 / 确认操作与批次历史。
+
 ## 快速开始
 
 ### Docker Compose
@@ -109,18 +130,25 @@ ANALYZER_A_URL=http://127.0.0.1:8001 ANALYZER_B_URL=http://127.0.0.1:8002 \
 - **④ 格式升级**：写入切换（双服务守卫）、读取切换（含全量历史事件守卫）
 - **⑤ 留存事件与解码结果**：事件带写入版本，可随时触发 A/B 解码
 - **⑥ 故障注入**：全局延迟、网页侧 / 分析服务侧一次性丢回执（切换、解码）
+- **⑦ 分批交付**：领取（≤20 条/批）、下载冻结 JSON、确认推进，断线重启从
+  未确认批次续传，旧批次不能越过下一批
 
 ## REST API 摘要
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/status` | 生效格式、分析服务状态、事件、切换、解码结果 |
+| GET | `/api/status` | 生效格式、分析服务状态、事件、切换、解码结果、交付进度 |
 | POST | `/api/events` | Avro 编码入仓，`decode_on` 可选触发解码 |
 | POST | `/api/events/decode` | 指定分析服务解码留存事件 |
 | POST | `/api/switches/writer` | 写入格式切换（守卫 + 两阶段） |
 | POST | `/api/switches/reader` | 读取格式切换（全历史守卫 + 栅栏） |
 | POST | `/api/reconcile` | 手动核实并继续全部 pending 切换 |
 | POST | `/api/simulate` | 延迟 / 丢回执故障注入 |
+| GET | `/api/delivery/progress` | 交付进度与批次历史 |
+| POST | `/api/delivery/claim` | 领取下一批（或原样重领未确认批次），无新事件返回空 |
+| POST | `/api/delivery/confirm` | 确认当前批次并推进进度（旧批次不得越批） |
+| GET | `/api/delivery/batches/{n}` | 某批次的冻结快照（含字节与 schema） |
+| GET | `/api/delivery/batches/{n}/download` | 下载批次 JSON（`?download=1` 为附件） |
 
 分析服务内部接口：`/health`、`/reader/state`、`/reader/switch`、
 `/writer/check`、`/events/decode`、`/simulate`。
@@ -128,11 +156,15 @@ ANALYZER_A_URL=http://127.0.0.1:8001 ANALYZER_B_URL=http://127.0.0.1:8002 \
 ## 测试
 
 ```bash
-# 36 项测试：23 兼容性单元测试 + 13 端到端集成测试（进程内 ASGI，无需网络）
+# 51 项测试：23 兼容性单元测试 + 13 端到端集成测试 + 15 分批交付测试
+# （进程内 ASGI，无需网络）
 PYTHONPATH=. python3 -m unittest discover -s tests -v
 
 # 真实三进程 HTTP 冒烟（先按上面本地方式起好三个服务）
 PYTHONPATH=. python3 tests/smoke_live.py
+
+# 真实三进程分批交付冒烟：含 webapp 被杀重启（断线续传）与入仓/切换交错
+PYTHONPATH=. python3 tests/smoke_delivery_live.py
 ```
 
 ## 已验证场景
@@ -146,9 +178,18 @@ PYTHONPATH=. python3 tests/smoke_live.py
 - 迟到切换：`base_version` 栅栏拒绝，生效版本不被回退
 - 切换与入仓交错：pending 期间兼容事件正常入仓且不丢失
 - 幂等重放：同一 `switch_id` 重复调用返回 `already_applied`
+- 分批交付：空仓领取返回空；每批 ≤20 条且按入仓顺序；逐条含事件号、
+  Base64 Avro 字节、写入版本与对应 schema
+- 断线续传：未确认批次重复领取 / webapp 重启后，批次号、事件范围、字节不变
+- 确认推进：只有确认当前批次才推进；旧批次重复确认不能越过下一批（409）；
+  最新批次重复确认幂等
+- 交付交错：领取后新事件与写入格式切换不改变已冻结批次，新事件只进后续
+  批次；领取事务失败回滚，不留半批、不跳过事件
 
 ## 限制 / 未覆盖
 
-- 单网页实例（未做网页自身的高可用部署；其状态已全部落 SQLite，重启可恢复）
+- 单网页实例（未做网页自身的高可用部署；其状态已全部落 SQLite，重启可恢复；
+  分批交付同样靠 SQLite 事务与进程锁保证单实例下的原子性，未做多实例并发领取）
 - 未实现 schema 注册中心的跨命名空间复杂引用（以自包含 record schema 为主）
 - 故障注入为一次性开关模型，未模拟持续网络分区
+- 交付批次只追加、不做过期清理；下载接口不做分页（单批上限 20 条）

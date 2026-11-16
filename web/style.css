@@ -111,3 +111,6 @@ td pre { max-height: 140px; margin: 0; }
 .msg-err { color: #a02626; font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
 .card.fault { border-color: #e6c88f; background: #fffdf6; }
 .pill { font-size: 11px; background: #e8eef7; border-radius: 5px; padding: 1px 6px; margin-left: 4px; }
+.button-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+.button-row button { margin-top: 0; }
+.button-row a { color: #1f6feb; font-size: 13px; }

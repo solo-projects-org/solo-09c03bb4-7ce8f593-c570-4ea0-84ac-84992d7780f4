@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from ..avro_codec import DEFAULT_SCHEMA_V1
 from . import db
 from .analyzer_client import ANALYZER_ORDER, build_clients
+from .delivery import DeliveryError, DeliveryService
 from .services import GuardError, SwitchService
 
 DB_PATH = os.environ.get("WEBAPP_DB", "/data/webapp.db")
@@ -23,6 +24,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL", "5"))
 
 service: Optional[SwitchService] = None
+delivery: Optional[DeliveryService] = None
 _bg_stop = threading.Event()
 
 
@@ -53,13 +55,16 @@ def _bg_reconcile() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global service
+    global service, delivery
     if service is None:  # tests may inject an in-process SwitchService
         db.init(_db_path())
         clients = build_clients(_analyzer_urls())
         service = SwitchService(_db_path(), clients)
     else:
         db.init(_db_path())
+    # Delivery state is fully durable in SQLite; the open batch simply
+    # resumes on restart without any recovery step.
+    delivery = DeliveryService(_db_path())
     # Startup reconciliation: verify every durable pending switch and resume.
     try:
         service.reconcile_all()
@@ -115,6 +120,10 @@ class DecodeIn(BaseModel):
     analyzer_id: str
 
 
+class ConfirmBatchIn(BaseModel):
+    batch_no: int
+
+
 # --- helpers ----------------------------------------------------------------
 
 def _guard_response(exc: GuardError, status: int = 409) -> JSONResponse:
@@ -136,7 +145,10 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 @app.get("/api/status")
 def get_status():
-    return service.status()
+    body = service.status()
+    body["delivery"] = {"progress": delivery.progress(),
+                        "batches": delivery.list_batches()}
+    return body
 
 
 @app.get("/api/default-schema")
@@ -221,6 +233,59 @@ def switch_reader(req: ReaderSwitchIn):
 @app.post("/api/reconcile")
 def reconcile():
     return {"ok": True, "result": service.reconcile_all()}
+
+
+# --- batch delivery ----------------------------------------------------------
+
+@app.get("/api/delivery/progress")
+def delivery_progress():
+    return {"ok": True, "progress": delivery.progress(),
+            "batches": delivery.list_batches()}
+
+
+@app.post("/api/delivery/claim")
+def delivery_claim():
+    """Freeze the next batch (max 20) or re-deliver the open one unchanged."""
+    try:
+        return {"ok": True, **delivery.claim()}
+    except DeliveryError as exc:
+        return JSONResponse(status_code=409,
+                            content={"ok": False, "error": str(exc)})
+
+
+@app.post("/api/delivery/confirm")
+def delivery_confirm(req: ConfirmBatchIn):
+    try:
+        return {"ok": True, **delivery.confirm(req.batch_no)}
+    except DeliveryError as exc:
+        return JSONResponse(status_code=409,
+                            content={"ok": False, "error": str(exc)})
+
+
+@app.get("/api/delivery/batches/{batch_no}")
+def delivery_batch(batch_no: int):
+    try:
+        return {"ok": True, "batch": delivery.get_batch(batch_no)}
+    except DeliveryError as exc:
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": str(exc)})
+
+
+@app.get("/api/delivery/batches/{batch_no}/download")
+def delivery_download(batch_no: int, download: int = 0):
+    """Frozen batch JSON in warehouse order; each event carries its event id,
+    original Avro bytes (Base64), writer version and matching schema."""
+    try:
+        envelope = delivery.download_batch(batch_no)
+    except DeliveryError as exc:
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": str(exc)})
+    if download:
+        return JSONResponse(
+            envelope,
+            headers={"Content-Disposition":
+                     f'attachment; filename="delivery-batch-{batch_no}.json"'})
+    return JSONResponse(envelope)
 
 
 # --- simulation -------------------------------------------------------------

@@ -119,6 +119,28 @@
     </table>
   </section>
 
+  <!-- ================= 分批交付 ================= -->
+  <section class="card">
+    <h2>⑦ 留存事件分批交付（分析组领取 / 下载 / 确认）</h2>
+    <div id="delivery-progress" class="state">加载中…</div>
+    <div class="button-row">
+      <button id="btn-delivery-claim" class="primary">领取下一批（每批最多 20 条）</button>
+      <button id="btn-delivery-download">下载当前批次 JSON</button>
+      <button id="btn-delivery-confirm" class="primary">确认当前批次并推进进度</button>
+    </div>
+    <div id="delivery-msg"></div>
+    <h3>当前未确认批次内容（冻结快照：事件号 / Avro 字节 Base64 / 写入版本 / schema）</h3>
+    <div id="delivery-open"></div>
+    <h3>批次历史</h3>
+    <table id="delivery-batches-table">
+      <thead><tr><th>批次号</th><th>状态</th><th>事件范围（入仓序号）</th><th>条数</th>
+      <th>领取时间</th><th>确认时间</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="hint">未确认批次重复领取或重启后，批次号、事件范围与 Avro 字节保持不变；只有确认当前批次才能推进，
+      重复确认旧批次不能越过下一批；新入仓事件只进入后续批次；无新事件时领取返回空。</div>
+  </section>
+
   <!-- ================= 故障注入 ================= -->
   <section class="card fault">
     <h2>⑥ 故障注入（模拟延迟 / 丢回执）</h2>

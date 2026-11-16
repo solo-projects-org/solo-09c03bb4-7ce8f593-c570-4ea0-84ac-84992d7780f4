@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS sim_config (
     drop_writer_switch  INTEGER NOT NULL DEFAULT 0,
     drop_reader_switch  INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS delivery_batches (
+    batch_no        INTEGER PRIMARY KEY AUTOINCREMENT,
+    status          TEXT NOT NULL CHECK (status IN ('claimed', 'confirmed')),
+    first_event_seq INTEGER NOT NULL,
+    last_event_seq  INTEGER NOT NULL,
+    event_count     INTEGER NOT NULL,
+    snapshot_json   TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    confirmed_at    TEXT
+);
 """
 
 
@@ -293,3 +303,59 @@ def consume_drop_flag(conn: sqlite3.Connection, flag: str) -> bool:
     if armed:
         conn.execute(f"UPDATE sim_config SET {flag} = 0 WHERE id = 1")
     return armed
+
+
+# ----- delivery batches -----------------------------------------------------
+
+def latest_delivery_batch(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM delivery_batches ORDER BY batch_no DESC LIMIT 1"
+    ).fetchone()
+
+
+def get_delivery_batch(conn: sqlite3.Connection, batch_no: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM delivery_batches WHERE batch_no = ?", (batch_no,)
+    ).fetchone()
+
+
+def list_delivery_batches(conn: sqlite3.Connection,
+                          limit: int = 50) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM delivery_batches ORDER BY batch_no DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def insert_delivery_batch(conn: sqlite3.Connection, *, first_event_seq: int,
+                          last_event_seq: int, event_count: int,
+                          snapshot: List[Dict[str, Any]]) -> int:
+    cur = conn.execute(
+        "INSERT INTO delivery_batches(status, first_event_seq, last_event_seq, "
+        "event_count, snapshot_json, created_at, confirmed_at) "
+        "VALUES ('claimed', ?, ?, ?, ?, ?, NULL)",
+        (first_event_seq, last_event_seq, event_count,
+         json.dumps(snapshot, ensure_ascii=False), _now()),
+    )
+    return int(cur.lastrowid)
+
+
+def confirm_delivery_batch(conn: sqlite3.Connection, batch_no: int) -> None:
+    conn.execute(
+        "UPDATE delivery_batches SET status = 'confirmed', confirmed_at = ? "
+        "WHERE batch_no = ?", (_now(), batch_no),
+    )
+
+
+def count_events(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
+
+
+def events_in_range(conn: sqlite3.Connection, first_seq: int,
+                    last_seq: int) -> List[sqlite3.Row]:
+    """Events in warehouse order (SQLite rowid is the durable ingestion order)."""
+    return conn.execute(
+        "SELECT rowid AS seq, id, writer_fp, writer_version, payload_json, "
+        "blob_b64, ingested_at FROM events "
+        "WHERE rowid BETWEEN ? AND ? ORDER BY rowid ASC",
+        (first_seq, last_seq),
+    ).fetchall()
